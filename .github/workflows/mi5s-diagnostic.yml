@@ -1,6 +1,9 @@
 name: Mi5s KernelPatch Diagnostic
 run-name: Mi5s KP 0.13.9 diagnostic
 on:
+  push:
+    paths:
+      - '.github/workflows/mi5s-diagnostic.yml'
   workflow_dispatch:
 permissions:
   contents: read
@@ -40,11 +43,8 @@ jobs:
 
           p = Path('kernel/patch/android/userd.c')
           s = p.read_text()
-          before = '''    int cplen = compat_copy_to_user((void *__user)sp, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));
-              if (cplen != sizeof(REPLACE_RC_FILE)) {'''
-          after = '''    int cplen = compat_copy_to_user((void *__user)sp, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));
-              log_boot("MI5S_INITRC sp=0x%llx ret=%d\\n", (unsigned long long)sp, cplen);
-              if (cplen != sizeof(REPLACE_RC_FILE)) {'''
+          before = '    int cplen = compat_copy_to_user((void *__user)sp, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));'
+          after = before + '\n    log_boot("MI5S_INITRC sp=0x%llx ret=%d\\n", (unsigned long long)sp, cplen);'
           if s.count(before) != 1:
               raise RuntimeError('Unknown userd.c layout; stopping rather than generating unsafe payload')
           p.write_text(s.replace(before, after, 1))
@@ -77,3 +77,4 @@ jobs:
             kernel/kpimg.elf
             DIAGNOSTIC_README.txt
           if-no-files-found: error
+# One-click build request (UTC): 2026-11-04T16:22:01Z
