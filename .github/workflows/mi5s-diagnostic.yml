@@ -1,0 +1,79 @@
+name: Mi5s KernelPatch Diagnostic
+run-name: Mi5s KP 0.13.9 diagnostic
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout official KernelPatch 0.13.9
+        uses: actions/checkout@v4
+        with:
+          repository: bmax121/KernelPatch
+          ref: 0.13.9
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Add read-only diagnostic logging
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('kernel/patch/common/utils.c')
+          s = p.read_text()
+          before = '    return cplen;\n}\nKP_EXPORT_SYMBOL(compat_copy_to_user);'
+          after = '''    static int mi5s_copy_errors_logged = 0;
+              if (cplen != n && mi5s_copy_errors_logged < 24) {
+                  mi5s_copy_errors_logged++;
+                  logke("MI5S_UCOPY ret=%d requested=%d seq=%d bits=%d trace=%d xt=%d\\n",
+                        cplen, n, !!kfunc(seq_buf_to_user), !!kfunc(bits_to_user),
+                        !!kfunc(trace_seq_to_user), !!kfunc(xt_data_to_user));
+              }
+              return cplen;
+          }
+          KP_EXPORT_SYMBOL(compat_copy_to_user);'''
+          if s.count(before) != 1:
+              raise RuntimeError('Unknown utils.c layout; stopping rather than generating unsafe payload')
+          p.write_text(s.replace(before, after, 1))
+
+          p = Path('kernel/patch/android/userd.c')
+          s = p.read_text()
+          before = '''    int cplen = compat_copy_to_user((void *__user)sp, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));
+              if (cplen != sizeof(REPLACE_RC_FILE)) {'''
+          after = '''    int cplen = compat_copy_to_user((void *__user)sp, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));
+              log_boot("MI5S_INITRC sp=0x%llx ret=%d\\n", (unsigned long long)sp, cplen);
+              if (cplen != sizeof(REPLACE_RC_FILE)) {'''
+          if s.count(before) != 1:
+              raise RuntimeError('Unknown userd.c layout; stopping rather than generating unsafe payload')
+          p.write_text(s.replace(before, after, 1))
+          print('Bounded diagnostics inserted; no root/boot behavior changes.')
+          PY
+
+      - name: Install official ARM GNU toolchain
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 -o compiler.tar.xz \
+            https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          tar -xf compiler.tar.xz
+          GCC=$(find "$PWD" -type f -name 'aarch64-none-elf-gcc' -print -quit)
+          test -n "$GCC"
+          echo "TARGET_COMPILE=${GCC%gcc}" >> "$GITHUB_ENV"
+
+      - name: Build diagnostic Android kpimg
+        shell: bash
+        run: |
+          export ANDROID=1
+          make -C kernel hdr kpimg -j2
+          printf 'Diagnostic only; do NOT flash as a boot image. No boot image is included.\n' > DIAGNOSTIC_README.txt
+
+      - name: Upload compiled payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi5s-kpimg-diagnostic
+          path: |
+            kernel/kpimg
+            kernel/kpimg.elf
+            DIAGNOSTIC_README.txt
+          if-no-files-found: error
