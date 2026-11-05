@@ -24,42 +24,19 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
-
           p = Path('kernel/patch/common/utils.c')
-          src = p.read_text()
-          old = '''    } else if (kfunc(bits_to_user)) {
-        // bits_to_user, str_to_user
-        cplen = compat_bits_copy_to_user(to, from, n);
-    } else if (kfunc(trace_seq_to_user)) {'''
-          new = '''    } else if (kfunc(bits_to_user)) {
-        // Legacy ARM64 4.4: one bounded fallback after EFAULT only.
-        cplen = compat_bits_copy_to_user(to, from, n);
-        if (kver < VERSION(4, 5, 0) && cplen == -EFAULT &&
-            n > 0 && n <= 256 && kfunc(xt_data_to_user)) {
-            int xt_rc = compat_xt_data_copy_to_user(to, from, n);
-            static int mi5s_log_count = 0;
-            if (mi5s_log_count++ < 16) {
-                logke("MI5S_UCOPY_V2 bits_rc=%d xt_rc=%d n=%d\\n",
-                      cplen, xt_rc, n);
-            }
-            if (xt_rc == 0) cplen = n;
-        }
-    } else if (kfunc(trace_seq_to_user)) {'''
-          if src.count(old) != 1:
-              raise RuntimeError('utils.c anchor mismatch; refusing to patch')
-          p.write_text(src.replace(old, new, 1))
-
+          s = p.read_text()
+          old = "    } else if (kfunc(bits_to_user)) {\n        // bits_to_user, str_to_user\n        cplen = compat_bits_copy_to_user(to, from, n);\n    } else if (kfunc(trace_seq_to_user)) {"
+          new = "    } else if (kfunc(bits_to_user)) {\n        // Mi5s: keep the normal path and try one bounded alternative after EFAULT.\n        cplen = compat_bits_copy_to_user(to, from, n);\n        if (kver < VERSION(4, 5, 0) && cplen == -EFAULT &&\n            n > 0 && n <= 256 && kfunc(xt_data_to_user)) {\n            int xt_rc = compat_xt_data_copy_to_user(to, from, n);\n            static int mi5s_log_count = 0;\n            if (mi5s_log_count++ < 16) {\n                logke(\"MI5S_UCOPY_V2 bits_rc=%d xt_rc=%d n=%d\\n\",\n                      cplen, xt_rc, n);\n            }\n            if (xt_rc == 0) cplen = n;\n        }\n    } else if (kfunc(trace_seq_to_user)) {"
+          if s.count(old) != 1: raise RuntimeError('utils anchor mismatch')
+          p.write_text(s.replace(old, new, 1))
           p = Path('kernel/patch/android/userd.c')
-          src = p.read_text()
-          old = '    int cplen = compat_copy_to_user((void *__user)sp, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));'
-          new = '''    log_boot("MI5S_STACK_V2 raw_sp=0x%llx dst=0x%llx pt_off=%d\\n",
-             (unsigned long long)current_user_stack_pointer(),
-             (unsigned long long)sp, (int)pt_regs_offset);
-    int cplen = compat_copy_to_user((void *__user)sp, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));'''
-          if src.count(old) != 1:
-              raise RuntimeError('userd.c anchor mismatch; refusing to patch')
-          p.write_text(src.replace(old, new, 1))
-          print("Mi5s v2: limited fallback and stack diagnostics inserted")
+          s = p.read_text()
+          old = "    int cplen = compat_copy_to_user((void *__user)sp, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));"
+          new = "    log_boot(\"MI5S_STACK_V2 raw_sp=0x%llx dst=0x%llx pt_off=%d\\n\",\n             (unsigned long long)current_user_stack_pointer(),\n             (unsigned long long)sp, (int)pt_regs_offset);\n    int cplen = compat_copy_to_user((void *__user)sp, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));"
+          if s.count(old) != 1: raise RuntimeError('userd anchor mismatch')
+          p.write_text(s.replace(old, new, 1))
+          print('Mi5s ucopy fallback v2: source patch applied')
           PY
 
       - name: Install official ARM GNU toolchain
