@@ -1,0 +1,231 @@
+name: Mi5s KP locked KStorage hardening v8
+run-name: Mi5s KP 0.13.9 kstorage-hardening-v8
+on:
+  push:
+    paths:
+      - '.github/workflows/mi5s-kstorage-hardening-v8.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout upstream 0.13.9
+        uses: actions/checkout@v4
+        with:
+          repository: bmax121/KernelPatch
+          ref: 0.13.9
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Apply locked KStorage and Linux 4.4 copy fixes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          u=Path("kernel/patch/common/utils.c")
+          s=u.read_text()
+          anchor="    if (kfunc(xt_data_to_user) && kver > VERSION(6, 7, 0) ) {"
+          fix="""    // Linux 4.4 Mi5s: xt_data_to_user validated in V2-V6.
+              if (kver >= VERSION(4, 4, 0) && kver < VERSION(4, 5, 0) &&
+                  kfunc(xt_data_to_user)) {
+                  cplen = compat_xt_data_copy_to_user(to, from, n);
+                  if (!cplen) cplen = n;
+              } else if (kfunc(xt_data_to_user) && kver > VERSION(6, 7, 0) ) {"""
+          assert s.count(anchor)==1
+          u.write_text(s.replace(anchor,fix,1))
+
+          p=Path("kernel/patch/common/kstorage.c")
+          s=p.read_text()
+          assert s.startswith("#include <kstorage.h>")
+          s="#include <common.h>\n"+s
+
+          start=s.index("    rcu_read_lock();",s.index("int write_kstorage("))
+          stop=s.index("    return 0;",start)
+          original=s[start:stop]
+          assert original.count("rcu_read_lock()")==1
+          assert original.count("rcu_read_unlock()")==1
+          assert original.count("call_rcu(&old->rcu, reclaim_callback);")==1
+
+          update="""    // Serialize lookup and mutation under the same group writer lock.
+              unsigned long flags = kp_private_spin_lock(lock);
+              hlist_for_each_entry(pos, bucket, hnode)
+              {
+                  if (pos->did == did) {
+                      old = pos;
+                      break;
+                  }
+              }
+              if (old) {
+                  hlist_replace_rcu(&old->hnode, &new->hnode);
+              } else {
+                  hlist_add_head_rcu(&new->hnode, bucket);
+                  group_sizes[gid]++;
+              }
+              kstorage_gen_bump();
+              kp_private_spin_unlock(lock, flags);
+
+              if (old) {
+                  // Never wait for RCU grace periods while holding a spinlock.
+                  if (kver >= VERSION(4, 4, 0) && kver < VERSION(4, 5, 0)) {
+                      if (kfunc(synchronize_rcu)) {
+                          kfunc(synchronize_rcu)();
+                          kvfree(old);
+                      } else {
+                          logkfe("MI5S_V8_SYNC_UNRESOLVED update\\n");
+                      }
+                  } else {
+                      call_rcu(&old->rcu, reclaim_callback);
+                  }
+              }
+          """
+          s=s[:start]+update+s[stop:]
+
+          start=s.index("int remove_kstorage(")
+          stop=s.index("KP_EXPORT_SYMBOL(remove_kstorage);",start)
+          original=s[start:stop]
+          assert original.count("call_rcu(&pos->rcu, reclaim_callback);")==1
+
+          remove="""int remove_kstorage(int gid, long did)
+          {
+              if (gid < 0 || gid >= KSTRORAGE_MAX_GROUP_NUM) return -ENOENT;
+
+              struct hlist_head *bucket = kstorage_bucket(gid, did);
+              spinlock_t *lock = &kstorage_glocks[gid];
+              struct kstorage *pos = 0;
+
+              unsigned long flags = kp_private_spin_lock(lock);
+              hlist_for_each_entry(pos, bucket, hnode)
+              {
+                  if (pos->did != did) continue;
+
+                  hlist_del_rcu(&pos->hnode);
+                  group_sizes[gid]--;
+                  kstorage_gen_bump();
+                  kp_private_spin_unlock(lock, flags);
+
+                  if (kver >= VERSION(4, 4, 0) && kver < VERSION(4, 5, 0)) {
+                      if (kfunc(synchronize_rcu)) {
+                          kfunc(synchronize_rcu)();
+                          kvfree(pos);
+                      } else {
+                          logkfe("MI5S_V8_SYNC_UNRESOLVED remove\\n");
+                      }
+                  } else {
+                      call_rcu(&pos->rcu, reclaim_callback);
+                  }
+                  return 0;
+              }
+
+              kp_private_spin_unlock(lock, flags);
+              return 0;
+          }
+          """
+          s=s[:start]+remove+s[stop:]
+
+          w=s[s.index("int write_kstorage("):s.index("KP_EXPORT_SYMBOL(write_kstorage)")]
+          r=s[s.index("int remove_kstorage("):s.index("KP_EXPORT_SYMBOL(remove_kstorage)")]
+          assert w.index("kp_private_spin_lock(lock)") < w.index("hlist_for_each_entry(pos, bucket, hnode)")
+          assert w.index("hlist_for_each_entry(pos, bucket, hnode)") < w.index("kp_private_spin_unlock(lock, flags)")
+          assert w.index("kp_private_spin_unlock(lock, flags)") < w.index("kfunc(synchronize_rcu)();")
+          assert r.index("kp_private_spin_unlock(lock, flags)") < r.index("kfunc(synchronize_rcu)();")
+          assert "MI5S_V7_SYNC_OK" not in s
+          assert "MI5S_V8_SYNC_UNRESOLVED" in s
+          # Narrow input hardening.  Keep V7's writer locks and RCU unchanged.
+          def change_function(source, name, next_marker, original, changed):
+              a=source.index("int "+name+"(")
+              b=source.index(next_marker,a)
+              fn=source[a:b]
+              assert fn.count(original)==1,(name,original)
+              return source[:a]+fn.replace(original,changed,1)+source[b:]
+
+          s=change_function(
+              s,"write_kstorage","KP_EXPORT_SYMBOL(write_kstorage);",
+              "    if (gid < 0 || gid >= KSTRORAGE_MAX_GROUP_NUM) return rc;",
+              """    if (gid < 0 || gid >= KSTRORAGE_MAX_GROUP_NUM) return rc;
+              if (len < 0 || offset < 0 ||
+                  len > 0x7fffffff - (int)sizeof(struct kstorage) ||
+                  offset > 0x7fffffff - len ||
+                  (!data && len > 0))
+                  return -EINVAL;""")
+          s=change_function(
+              s,"write_kstorage","KP_EXPORT_SYMBOL(write_kstorage);",
+              "    if (data_is_user) {",
+              """    if (!len) {
+                  /* Zero-length records need no copy. */
+              } else if (data_is_user) {""")
+          s=change_function(
+              s,"read_kstorage","KP_EXPORT_SYMBOL(read_kstorage);",
+              "    int rc = 0;\n    rcu_read_lock();",
+              """    if (gid < 0 || gid >= KSTRORAGE_MAX_GROUP_NUM ||
+                  len < 0 || offset < 0 || (!data && len > 0))
+                  return -EINVAL;
+              int rc = 0;
+              rcu_read_lock();""")
+          s=change_function(
+              s,"read_kstorage","KP_EXPORT_SYMBOL(read_kstorage);",
+              "    int min_len = pos->dlen - offset > len ? len : pos->dlen - offset;",
+              """    if (pos->dlen < 0 || offset > pos->dlen) {
+                  rcu_read_unlock();
+                  return -EINVAL;
+              }
+              int available = pos->dlen - offset;
+              int min_len = available > len ? len : available;
+              if (!min_len) {
+                  rcu_read_unlock();
+                  return 0;
+              }""")
+          s=change_function(
+              s,"list_kstorage_ids","KP_EXPORT_SYMBOL(list_kstorage_ids);",
+              "    if (gid < 0 || gid >= KSTRORAGE_MAX_GROUP_NUM) return -ENOENT;",
+              """    if (gid < 0 || gid >= KSTRORAGE_MAX_GROUP_NUM) return -ENOENT;
+              if (idslen < 0 || (!ids && idslen > 0)) return -EINVAL;
+              if (!idslen) return 0;""")
+          s=change_function(
+              s,"on_each_kstorage_elem","KP_EXPORT_SYMBOL(on_each_kstorage_elem);",
+              "    int rc = 0;",
+              """    if (gid < 0 || gid >= KSTRORAGE_MAX_GROUP_NUM || !cb) return -EINVAL;
+              int rc = 0;""")
+          assert s.count("int available = pos->dlen - offset;")==1
+          assert s.count("offset > 0x7fffffff - len")==1
+          assert s.count("if (idslen < 0 || (!ids && idslen > 0))")==1
+          assert s.count("if (gid < 0 || gid >= KSTRORAGE_MAX_GROUP_NUM || !cb)")==1
+          assert s.count("if (!len) {")==1
+
+          # One unobtrusive marker to distinguish V8 from V7 on actual boot.
+          assert s.count("int kstorage_init()\n{")==1
+          s=s.replace("int kstorage_init()\n{",
+                      'int kstorage_init()\n{\n    logkfi("MI5S_V8_KSTORAGE_INIT\\\\n");',1)
+          assert "MI5S_V8_KSTORAGE_INIT" in s
+
+          p.write_text(s)
+          print("MI5S_V8_LOCKED_KSTORAGE_HARDENED")
+          PY
+
+      - name: Install ARM cross compiler
+        shell: bash
+        run: |
+          curl -fL --retry 3 -o gcc.tar.xz \
+            https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          tar -xf gcc.tar.xz
+          GCC=$(find "$PWD" -type f -name 'aarch64-none-elf-gcc' -print -quit)
+          test -n "$GCC"
+          echo "TARGET_COMPILE=${GCC%gcc}" >> "$GITHUB_ENV"
+
+      - name: Compile Android KP payload
+        shell: bash
+        run: |
+          export ANDROID=1
+          make -C kernel hdr kpimg -j2
+          printf '%s\n' 'V8 CANDIDATE; based on tested v7; validated KStorage parameters; no diagnostic spam. TEMPORARY BOOT ONLY.' > README_V8.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi5s-kpimg-kstorage-hardening-v8
+          path: |
+            kernel/kpimg
+            kernel/kpimg.elf
+            README_V8.txt
+          if-no-files-found: error
