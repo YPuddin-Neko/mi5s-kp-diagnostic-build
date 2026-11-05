@@ -1,7 +1,7 @@
-# Mi5s reusable APatch tester / local Android Boot builder.
+﻿# Mi5s reusable APatch tester / local Android Boot builder.
 # Windows PowerShell 5.1+, GitHub CLI + kptools, adb/fastboot.
 # No unattended flashing, booting, or upload of secrets / diagnostic logs.
-$ToolVersion = '1.2.0'
+$ToolVersion = '1.2.1'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version Latest
@@ -418,7 +418,14 @@ function Update-Manager {
     if ($ok -cne 'UPDATE') { Write-Host '已取消更新。'; return }
     $path = Join-Path $BaseDir 'mi5s-manager.ps1'
     $tmp = Join-Path $BaseDir 'mi5s-manager.update.tmp'
-    [IO.File]::WriteAllText($tmp, $incoming, (New-Object System.Text.UTF8Encoding($false)))
+    # Windows PowerShell 5.1 reads UTF-8 without BOM as an ANSI code page.
+    # Validate the downloaded script before replacing the active installation.
+    $parseTokens = $null
+    $parseErrors = $null
+    $null = [System.Management.Automation.Language.Parser]::ParseInput(
+        $incoming, [ref]$parseTokens, [ref]$parseErrors)
+    if ($parseErrors.Count -gt 0) { throw 'GitHub 脚本语法验证失败，拒绝覆盖当前工具。' }
+    [IO.File]::WriteAllText($tmp, $incoming, (New-Object System.Text.UTF8Encoding($true)))
     try {
         Copy-Item -LiteralPath $tmp -Destination $path -Force
     } finally { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
