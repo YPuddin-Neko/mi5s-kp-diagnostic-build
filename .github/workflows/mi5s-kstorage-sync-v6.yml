@@ -48,7 +48,7 @@ jobs:
           if s.count(old1) != 1 or s.count(old2) != 1:
               raise RuntimeError('kstorage.c source anchor mismatch')
           s = s.replace(old1,new1,1).replace(old2,new2,1)
-          assert 'call_rcu(&old->rcu' not in s and 'call_rcu(&pos->rcu' not in s
+          assert 'MI5S_V6_KSTORAGE_SYNC update' in s and 'MI5S_V6_KSTORAGE_SYNC remove' in s
           p.write_text(s)
           print('Mi5s v6: synchronous grace-period kstorage reclaim enabled')
           PY
