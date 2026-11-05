@@ -1,0 +1,91 @@
+name: Mi5s KP ucopy fallback v2
+run-name: Mi5s KP 0.13.9 ucopy-v2
+on:
+  push:
+    paths:
+      - '.github/workflows/mi5s-ucopy-v2.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout KernelPatch 0.13.9
+        uses: actions/checkout@v4
+        with:
+          repository: bmax121/KernelPatch
+          ref: 0.13.9
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Apply Mi5s 4.4 usercopy fallback diagnostics
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('kernel/patch/common/utils.c')
+          src = p.read_text()
+          old = '''    } else if (kfunc(bits_to_user)) {
+                  // bits_to_user, str_to_user
+                  cplen = compat_bits_copy_to_user(to, from, n);
+              } else if (kfunc(trace_seq_to_user)) {'''
+          new = '''    } else if (kfunc(bits_to_user)) {
+                  // Mi5s legacy 4.4: try the original route, then a limited
+                  // alternate copy only on EFAULT. Never bypass uaccess checks.
+                  cplen = compat_bits_copy_to_user(to, from, n);
+                  if (kver < VERSION(4, 5, 0) && cplen == -EFAULT &&
+                      n > 0 && n <= 256 && kfunc(xt_data_to_user)) {
+                      int xt_rc = compat_xt_data_copy_to_user(to, from, n);
+                      static int mi5s_log_count = 0;
+                      if (mi5s_log_count++ < 16) {
+                          logke("MI5S_UCOPY_V2 bits_rc=%d xt_rc=%d n=%d\\n",
+                                cplen, xt_rc, n);
+                      }
+                      if (xt_rc == 0) cplen = n;
+                  }
+              } else if (kfunc(trace_seq_to_user)) {'''
+          if src.count(old) != 1:
+              raise RuntimeError('utils.c anchor mismatch; refusing to patch')
+          p.write_text(src.replace(old, new, 1))
+
+          p = Path('kernel/patch/android/userd.c')
+          src = p.read_text()
+          old = '    int cplen = compat_copy_to_user((void *__user)sp, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));'
+          new = '''    log_boot("MI5S_STACK_V2 raw_sp=0x%llx dst=0x%llx pt_off=%d\\n",
+                       (unsigned long long)current_user_stack_pointer(),
+                       (unsigned long long)sp, (int)pt_regs_offset);
+              int cplen = compat_copy_to_user((void *__user)sp, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));'''
+          if src.count(old) != 1:
+              raise RuntimeError('userd.c anchor mismatch; refusing to patch')
+          p.write_text(src.replace(old, new, 1))
+          print("Mi5s v2: limited fallback and stack diagnostics inserted")
+          PY
+
+      - name: Install official ARM GNU toolchain
+        shell: bash
+        run: |
+          curl -fL --retry 3 -o compiler.tar.xz \
+            https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          tar -xf compiler.tar.xz
+          GCC=$(find "$PWD" -type f -name 'aarch64-none-elf-gcc' -print -quit)
+          test -n "$GCC"
+          echo "TARGET_COMPILE=${GCC%gcc}" >> "$GITHUB_ENV"
+
+      - name: Build Android kpimg
+        shell: bash
+        run: |
+          export ANDROID=1
+          make -C kernel hdr kpimg -j2
+          printf 'Experimental v2, for temporary fastboot boot only. No boot.img or keys included.\n' > V2_NOTES.txt
+
+      - name: Upload payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi5s-kpimg-ucopy-v2
+          path: |
+            kernel/kpimg
+            kernel/kpimg.elf
+            V2_NOTES.txt
+          if-no-files-found: error
