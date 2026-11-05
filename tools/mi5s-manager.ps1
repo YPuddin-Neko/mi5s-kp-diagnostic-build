@@ -1,7 +1,7 @@
 # Mi5s reusable APatch tester / local Android Boot builder.
 # Windows PowerShell 5.1+, GitHub CLI + kptools, adb/fastboot.
 # No unattended flashing, booting, or upload of secrets / diagnostic logs.
-$ToolVersion = '1.1.0'
+$ToolVersion = '1.2.0'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version Latest
@@ -211,7 +211,22 @@ function Get-DeviceSerial([string]$adb) {
     return [string]$ids[0]
 }
 function Adb-Shell([string]$adb, [string]$serial, [string]$script) {
-    return (Capture $adb @('-s',$serial,'shell',$script) -AllowFailure).Trim()
+    # In Windows PowerShell 5.1, native stderr can become a terminating error
+    # when the session has ErrorActionPreference=Stop. A missing virtual su
+    # is a DIAGNOSTIC RESULT, not a reason to abandon the rest of the report.
+    $savedPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & $adb '-s' $serial 'shell' $script 2>$null | Out-String
+        $rc = $LASTEXITCODE
+        if ($rc -ne 0) { return '' }
+        return ([string]$output).Trim()
+    } catch {
+        # Never print raw native stderr: init or other log lines may contain keys.
+        return ''
+    } finally {
+        $ErrorActionPreference = $savedPreference
+    }
 }
 function Get-TestResult {
     $tools = Get-AndroidTools
@@ -226,6 +241,7 @@ function Get-TestResult {
     $booted = Adb-Shell $adb $serial 'getprop sys.boot_completed'
     $apd = Adb-Shell $adb $serial 'pidof apd'
     $su = Adb-Shell $adb $serial '/system/bin/su -c id'
+    if ([string]::IsNullOrWhiteSpace($su)) { $su = '(unavailable)' }
     $selinux = Adb-Shell $adb $serial 'getenforce'
     $rom = Adb-Shell $adb $serial 'getprop ro.product.device'
     $apdInfo = Adb-Shell $adb $serial 'ls -lZ /data/adb/apd'
@@ -234,6 +250,7 @@ function Get-TestResult {
     # dumped to files, printed, or copied to clipboard. Even init command
     # lines may carry the SuperKey.
     $dmesgRaw = Adb-Shell $adb $serial 'dmesg'
+    $dmesgAvailable = -not [string]::IsNullOrWhiteSpace($dmesgRaw)
     $errorsSafe = @()
     $versionSafe = @()
     foreach ($line in ($dmesgRaw -split "`r?`n")) {
@@ -260,6 +277,7 @@ function Get-TestResult {
     # Full logcat is read locally and immediately discarded after counting
     # anchored init errors. Never include the init service's command string.
     $logcatRaw = Adb-Shell $adb $serial 'logcat -b all -d -v brief'
+    $logcatAvailable = -not [string]::IsNullOrWhiteSpace($logcatRaw)
     foreach ($line in ($logcatRaw -split "`r?`n")) {
         if ($line -match '^E/init\s*\(\s*0\): cannot execv') { $execFails++ }
         if ($line -match '^I/init\s*\(\s*0\): Service .*exited with status 127') { $status127++ }
@@ -268,8 +286,11 @@ function Get-TestResult {
 
     # PASS checks only APD bootstrap + shell root; it does not verify third-party authorization.
     $healthy = $booted -eq '1' -and -not [string]::IsNullOrWhiteSpace($apd) -and
-        $su -match 'uid=0\(root\)' -and $su -match 'u:r:magisk:s0' -and $errorsSafe.Count -eq 0
-    $status = if ($healthy) { 'PASS' } elseif ($booted -ne '1') { 'BOOT_INCOMPLETE' } else { 'FAIL' }
+        $su -match 'uid=0\(root\)' -and $su -match 'u:r:magisk:s0' -and
+        $errorsSafe.Count -eq 0 -and $dmesgAvailable -and $logcatAvailable
+    $status = if ($healthy) { 'PASS' } elseif ($booted -ne '1') { 'BOOT_INCOMPLETE' }
+        elseif (-not $dmesgAvailable -or -not $logcatAvailable) { 'INCOMPLETE' }
+        else { 'FAIL' }
     $result = [ordered]@{
         timestamp=(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         status=$status
@@ -281,6 +302,8 @@ function Get-TestResult {
         selinux=$selinux
         apd_file=$apdInfo
         kernel_issue_lines=$errorsSafe
+        dmesg_collected=$dmesgAvailable
+        logcat_collected=$logcatAvailable
         version_markers=$versionSafe
         init_execv_failures_seen=$execFails
         init_status_127_seen=$status127
@@ -300,6 +323,8 @@ function Get-TestResult {
         ('SELinux: ' + $selinux),
         ('APD file: ' + $apdInfo),
         ('Kernel problems: ' + $errorsSafe.Count),
+        ('Kernel log collected: ' + $dmesgAvailable),
+        ('Android log collected: ' + $logcatAvailable),
         ('Init execv failures seen: ' + $execFails),
         ('Init status 127 seen: ' + $status127),
         ('Version markers:'),
@@ -314,10 +339,11 @@ function Get-TestResult {
     Write-Host ('APD: ' + $(if ($apd) { $apd } else { '(not running)' }))
     Write-Host ('Root: ' + $su)
     Write-Host ('Kernel problems: ' + $errorsSafe.Count + ' | init execv errors: ' + $execFails + ' | status 127: ' + $status127)
+    Write-Host ('Diagnostics collected: dmesg=' + $dmesgAvailable + ', logcat=' + $logcatAvailable)
     Write-Host ('Version marker(s): ' + ($versionSafe -join ' ; '))
     Write-Host ('Report: ' + $base + '.txt') -ForegroundColor Cyan
     Write-Host '------------------------------------------'
-    $summary = ('Mi5s ' + $status + ' | uptime=' + $time + ' | boot=' + $booted + ' | apd=' + $apd + ' | su=' + $su + ' | kernelProblems=' + $errorsSafe.Count + ' | execvFailures=' + $execFails + ' | status127=' + $status127 + ' | versions=' + ($versionSafe -join ' ; '))
+    $summary = ('Mi5s ' + $status + ' | uptime=' + $time + ' | boot=' + $booted + ' | apd=' + $apd + ' | su=' + $su + ' | kernelProblems=' + $errorsSafe.Count + ' | execvFailures=' + $execFails + ' | status127=' + $status127 + ' | logs=' + [string]$dmesgAvailable + '/' + [string]$logcatAvailable + ' | versions=' + ($versionSafe -join ' ; '))
     try { Set-Clipboard -Value $summary -ErrorAction Stop; Write-Host '精简结果已复制到剪贴板，可直接粘贴给 ChatGPT。' -ForegroundColor Green }
     catch { Write-Host '未能复制剪贴板，请手动复制上面的精简结果。' -ForegroundColor Yellow }
     return $result
