@@ -1,0 +1,80 @@
+name: Mi5s KP kstorage RCU isolation v5
+run-name: Mi5s KP 0.13.9 kstorage-rcu-v5
+on:
+  push:
+    paths:
+      - '.github/workflows/mi5s-kstorage-rcu-v5.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout upstream 0.13.9
+        uses: actions/checkout@v4
+        with:
+          repository: bmax121/KernelPatch
+          ref: 0.13.9
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Apply isolated copy-path diagnostic change
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('kernel/patch/common/utils.c')
+          s=p.read_text()
+          old="    if (kfunc(xt_data_to_user) && kver > VERSION(6, 7, 0) ) {"
+          new="    // Mi 5s Linux 4.4 diagnostic: skip bits_to_user entirely.\n    // Use the copy path that returned success in the v2 experiment.\n    if (kver >= VERSION(4, 4, 0) && kver < VERSION(4, 5, 0) &&\n        kfunc(xt_data_to_user)) {\n        int rc = compat_xt_data_copy_to_user(to, from, n);\n        static int mi5s_v3_log_count = 0;\n        if (mi5s_v3_log_count++ < 24)\n            logke(\"MI5S_UCOPY_V3 direct_xt_rc=%d n=%d\\\\n\", rc, n);\n        cplen = (rc == 0) ? n : rc;\n    } else if (kfunc(xt_data_to_user) && kver > VERSION(6, 7, 0) ) {"
+          assert s.count(old)==1, 'unsafe source mismatch utils'
+          p.write_text(s.replace(old,new,1))
+          p=Path('kernel/patch/android/userd.c')
+          s=p.read_text()
+          old="    int cplen = compat_copy_to_user((void *__user)sp, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));"
+          new="    log_boot(\"MI5S_STACK_V3 raw_sp=0x%llx dst=0x%llx pt_off=%d\\\\n\",\n             (unsigned long long)current_user_stack_pointer(),\n             (unsigned long long)sp, (int)pt_regs_offset);\n    int cplen = compat_copy_to_user((void *__user)sp, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));"
+          assert s.count(old)==1, 'unsafe source mismatch userd'
+          p.write_text(s.replace(old,new,1))
+          print('Mi5s v3 diagnostic direct XT path injected (not a confirmed boot fix)')
+          from pathlib import Path
+          p = Path('kernel/patch/common/kstorage.c')
+          s = p.read_text()
+          old1 = "    if (old) {\n        bool async = true;\n        if (async) {\n            call_rcu(&old->rcu, reclaim_callback);\n        } else {\n            synchronize_rcu();\n            kvfree(old);\n        }\n    }"
+          new1 = "    if (old) {\n        /* Mi5s DIAGNOSTIC ONLY: deliberately retain replaced objects.\n         * Isolate KernelPatch's call_rcu activity without changing kernel RCU.\n         * This leaks memory; never use as a permanent production build. */\n        static unsigned int mi5s_v5_update_skips;\n        if (mi5s_v5_update_skips++ < 32)\n            logkfe(\"MI5S_V5_SKIP_KSTORAGE_RCU update gid=%d did=%ld\\n\", gid, did);\n    }"
+          old2 = "            bool async = true;\n            if (async) {\n                call_rcu(&pos->rcu, reclaim_callback);\n            } else {\n                synchronize_rcu();\n                kvfree(pos);\n            }"
+          new2 = "            /* Mi5s diagnostic: removed objects are retained as well. */\n            static unsigned int mi5s_v5_remove_skips;\n            if (mi5s_v5_remove_skips++ < 32)\n                logkfe(\"MI5S_V5_SKIP_KSTORAGE_RCU remove gid=%d did=%ld\\n\", gid, did);"
+          if s.count(old1) != 1 or s.count(old2) != 1:
+              raise RuntimeError('kstorage.c source anchor mismatch')
+          s = s.replace(old1,new1,1).replace(old2,new2,1)
+          assert 'call_rcu(&old->rcu' not in s and 'call_rcu(&pos->rcu' not in s
+          p.write_text(s)
+          print('Mi5s v5: KernelPatch kstorage RCU reclamation temporarily bypassed (leaks memory)')
+          PY
+
+      - name: Install ARM cross compiler
+        shell: bash
+        run: |
+          curl -fL --retry 3 -o gcc.tar.xz \
+            https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          tar -xf gcc.tar.xz
+          GCC=$(find "$PWD" -type f -name 'aarch64-none-elf-gcc' -print -quit)
+          test -n "$GCC"
+          echo "TARGET_COMPILE=${GCC%gcc}" >> "$GITHUB_ENV"
+
+      - name: Compile Android KP payload
+        shell: bash
+        run: |
+          export ANDROID=1
+          make -C kernel hdr kpimg -j2
+          printf '%s\n' 'EXPERIMENTAL v5; kstorage RCU callbacks bypassed; leaks memory. DO NOT FLASH.' > README_V5.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi5s-kpimg-kstorage-rcu-v5
+          path: |
+            kernel/kpimg
+            kernel/kpimg.elf
+            README_V5.txt
+          if-no-files-found: error
